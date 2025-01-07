@@ -29,6 +29,9 @@ COPY .licenses/ /LICENSES/
 # its cache and can force a rebuild from here.
 ARG HASH_BINARY=0
 
+# Install iptables and iproute2
+RUN apk add --no-cache iproute2 iptables
+
 # Add the platform-specific binary.
 COPY bin/{ARG_OS}_{ARG_ARCH}/{ARG_BIN} /{ARG_BIN}
 

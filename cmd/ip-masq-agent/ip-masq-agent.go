@@ -47,6 +47,8 @@ const (
 	configPath = "/etc/config/ip-masq-agent"
 	// How frequently to write identical logs at verbosity 2 (otherwise 4)
 	identicalLogDelay = 24 * time.Hour
+	// IP rule priority for non-masquerade CIDRs
+	ipRulePriority = 20
 )
 
 var (
@@ -123,6 +125,7 @@ type MasqDaemon struct {
 	iptables     utiliptables.Interface
 	ip6tables    utiliptables.Interface
 	logReduction *logreduction.LogReduction
+	execer       utilexec.Interface
 }
 
 // NewMasqDaemon returns a MasqDaemon with default values, including an initialized utiliptables.Interface
@@ -137,7 +140,90 @@ func NewMasqDaemon(c *MasqConfig) *MasqDaemon {
 		iptables:     iptables,
 		ip6tables:    ip6tables,
 		logReduction: logreduction.NewLogReduction(identicalLogDelay),
+		execer:       execer,
 	}
+}
+
+// syncIPRules ensures that IP rules are in sync with the NonMasqueradeCIDRs
+func (m *MasqDaemon) syncIPRules() error {
+	// Get existing rules
+	existingRules, err := m.getIPRules()
+	if err != nil {
+		return fmt.Errorf("failed to get existing IP rules: %v", err)
+	}
+
+	// Create a map of existing rules for our priority
+	existingRuleMap := make(map[string]bool)
+	for _, rule := range existingRules {
+		if rule != "" {
+			existingRuleMap[rule] = true
+		}
+	}
+
+	// klog.Infof("existingRuleMap: %s", existingRuleMap)
+
+	// For each CIDR in NonMasqueradeCIDRs, ensure a rule exists
+	for _, cidr := range m.config.NonMasqueradeCIDRs {
+		if !isIPv6CIDR(cidr) { // Only handle IPv4 rules for now
+			ruleStr := fmt.Sprintf("not from all to %s lookup main", cidr)
+			// klog.Infof("ruleStr: %s", ruleStr)
+			if !existingRuleMap[ruleStr] {
+				if err := m.addIPRule(cidr); err != nil {
+					return fmt.Errorf("failed to add IP rule for CIDR %s: %v", cidr, err)
+				}
+			}
+			delete(existingRuleMap, ruleStr)
+		}
+	}
+
+	// Remove any existing rules that are no longer in NonMasqueradeCIDRs
+	for rule := range existingRuleMap {
+		if err := m.removeIPRule(rule); err != nil {
+			return fmt.Errorf("failed to remove IP rule %s: %v", rule, err)
+		}
+	}
+
+	return nil
+}
+
+// getIPRules returns a list of existing IP rules
+func (m *MasqDaemon) getIPRules() ([]string, error) {
+	cmd := m.execer.Command("ip", "rule", "show", "prio", strconv.Itoa(ipRulePriority))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list IP rules: %v", err)
+	}
+
+	rawRules := strings.Split(strings.TrimSpace(string(output)), "\n")
+	
+	rules := make([]string, len(rawRules))
+	for i, rule := range rawRules {
+		rules[i] = strings.TrimSpace(strings.TrimPrefix(rule,  fmt.Sprintf("%d:", ipRulePriority)))
+	}
+	
+	// klog.Infof("Existing rules: %s", rules)
+	
+	return rules, nil
+}
+
+// addIPRule adds an IP rule for the given CIDR
+func (m *MasqDaemon) addIPRule(cidr string) error {
+	cmd := m.execer.Command("ip", "rule", "add", "prio", strconv.Itoa(ipRulePriority), "not", "to", cidr, "lookup", "main")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to add IP rule: %v, output: %s", err, string(output))
+	}
+	return nil
+}
+
+// removeIPRule removes an IP rule
+func (m *MasqDaemon) removeIPRule(rule string) error {
+	cmd := m.execer.Command("ip", "rule", "del", rule)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to remove IP rule: %v, output: %s", err, string(output))
+	}
+	return nil
 }
 
 func main() {
@@ -180,6 +266,11 @@ func (m *MasqDaemon) Run() {
 			// resync config
 			if err := m.osSyncConfig(); err != nil {
 				klog.Errorf("Error syncing configuration: %v", err)
+				return
+			}
+			// sync IP rules
+			if err := m.syncIPRules(); err != nil {
+				klog.Errorf("Error syncing IP rules: %v", err)
 				return
 			}
 			// resync rules

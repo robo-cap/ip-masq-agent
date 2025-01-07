@@ -5,6 +5,7 @@
 /.dockerfile-*
 /.licenses*
 /.buildx-initialized
+/oke
 
 # Emacs save files
 *~
