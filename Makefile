@@ -30,7 +30,9 @@ ALL_PLATFORMS ?= linux/amd64 linux/arm linux/arm64 linux/ppc64le linux/s390x
 
 # The "FROM" part of the Dockerfile.  This should be a manifest-list which
 # supports all of the platforms listed in ALL_PLATFORMS.
-BASE_IMAGE ?= registry.k8s.io/build-image/distroless-iptables:v0.7.7
+# NOTE: overridden to alpine because the agent now needs iproute2 (the `ip`
+# tool) for policy routing; distroless-iptables has no package manager.
+BASE_IMAGE ?= alpine
 
 # Where to push the docker images.
 REGISTRY ?= gcr.io/k8s-staging-networking

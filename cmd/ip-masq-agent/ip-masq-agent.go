@@ -37,6 +37,7 @@ import (
 	"k8s.io/ip-masq-agent/pkg/version"
 	"k8s.io/klog/v2"
 	utiliptables "k8s.io/kubernetes/pkg/util/iptables"
+	utilexec "k8s.io/utils/exec"
 )
 
 const (
@@ -47,6 +48,10 @@ const (
 	configPath = "/etc/config/ip-masq-agent"
 	// How frequently to write identical logs at verbosity 2 (otherwise 4)
 	identicalLogDelay = 24 * time.Hour
+	// IP rule priority used for the non-masquerade policy routing rules.
+	// Must be lower (higher precedence) than any CNI-managed rules; on OKE NPN
+	// (VCN-native) the per-pod rules live at prio 512/1536, so 20 is safe.
+	ipRulePriority = 20
 )
 
 var (
@@ -105,10 +110,12 @@ type MasqDaemon struct {
 	iptables     utiliptables.Interface
 	ip6tables    utiliptables.Interface
 	logReduction *logreduction.LogReduction
+	execer       utilexec.Interface
 }
 
 // NewMasqDaemon returns a MasqDaemon with default values, including an initialized utiliptables.Interface
 func NewMasqDaemon(c *MasqConfig) *MasqDaemon {
+	execer := utilexec.New()
 	protocolv4 := utiliptables.ProtocolIPv4
 	protocolv6 := utiliptables.ProtocolIPv6
 	iptables := utiliptables.New(protocolv4)
@@ -118,7 +125,93 @@ func NewMasqDaemon(c *MasqConfig) *MasqDaemon {
 		iptables:     iptables,
 		ip6tables:    ip6tables,
 		logReduction: logreduction.NewLogReduction(identicalLogDelay),
+		execer:       execer,
 	}
+}
+
+// syncIPRules reconciles the policy routing rules used to bypass masquerading
+// for the configured NonMasqueradeCIDRs. One "not to <cidr> lookup main" rule
+// is maintained at ipRulePriority per IPv4 CIDR. IPv6 CIDRs are intentionally
+// skipped (handled by the iptables ip6tables path).
+func (m *MasqDaemon) syncIPRules() error {
+	existing, err := m.getIPRules()
+	if err != nil {
+		return fmt.Errorf("failed to get existing IP rules: %v", err)
+	}
+
+	desired := make(map[string]bool, len(m.config.NonMasqueradeCIDRs))
+	for _, cidr := range m.config.NonMasqueradeCIDRs {
+		if isIPv6CIDR(cidr) {
+			continue
+		}
+		desired[cidr] = true
+		if !existing[cidr] {
+			if err := m.addIPRule(cidr); err != nil {
+				return fmt.Errorf("failed to add IP rule for CIDR %s: %v", cidr, err)
+			}
+		}
+	}
+
+	// Remove rules that are no longer desired. removeIPRule is given the CIDR
+	// and emits properly tokenized argv (a single concatenated string would be
+	// rejected by `ip rule` with "Failed to parse rule type").
+	for cidr := range existing {
+		if !desired[cidr] {
+			if err := m.removeIPRule(cidr); err != nil {
+				return fmt.Errorf("failed to remove IP rule for CIDR %s: %v", cidr, err)
+			}
+		}
+	}
+	return nil
+}
+
+// getIPRules returns the set of destination CIDRs that currently have a rule at
+// ipRulePriority. Output lines look like:
+//
+//	20: not from all to 10.30.0.0/16 lookup main
+//
+// We parse out the CIDR following the "to" keyword rather than matching the
+// whole line, so the reconciliation is robust against cosmetic iproute2 output
+// changes.
+func (m *MasqDaemon) getIPRules() (map[string]bool, error) {
+	out, err := m.execer.Command("ip", "rule", "show", "prio", strconv.Itoa(ipRulePriority)).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list IP rules: %v, output: %s", err, string(out))
+	}
+
+	rules := make(map[string]bool)
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "to" && i+1 < len(fields) {
+				rules[fields[i+1]] = true
+				break
+			}
+		}
+	}
+	return rules, nil
+}
+
+// addIPRule adds a "not to <cidr> lookup main" rule at ipRulePriority.
+func (m *MasqDaemon) addIPRule(cidr string) error {
+	out, err := m.execer.Command("ip", "rule", "add", "prio", strconv.Itoa(ipRulePriority), "not", "to", cidr, "lookup", "main").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to add IP rule: %v, output: %s", err, string(out))
+	}
+	return nil
+}
+
+// removeIPRule removes the "not to <cidr> lookup main" rule at ipRulePriority.
+func (m *MasqDaemon) removeIPRule(cidr string) error {
+	out, err := m.execer.Command("ip", "rule", "del", "prio", strconv.Itoa(ipRulePriority), "not", "to", cidr, "lookup", "main").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to remove IP rule: %v, output: %s", err, string(out))
+	}
+	return nil
 }
 
 func main() {
@@ -163,6 +256,12 @@ func (m *MasqDaemon) Run() {
 			// resync config
 			if err := m.osSyncConfig(); err != nil {
 				klog.Errorf("Error syncing configuration: %v", err)
+				return
+			}
+			// sync policy routing rules (must succeed before masquerade rules
+			// are synced so that non-masquerade CIDRs bypass IP-MASQ-AGENT).
+			if err := m.syncIPRules(); err != nil {
+				klog.Errorf("Error syncing IP rules: %v", err)
 				return
 			}
 			// resync rules

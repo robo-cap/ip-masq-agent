@@ -19,8 +19,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"testing"
@@ -32,6 +34,7 @@ import (
 	"k8s.io/ip-masq-agent/pkg/interval"
 	utiliptables "k8s.io/kubernetes/pkg/util/iptables"
 	iptest "k8s.io/kubernetes/pkg/util/iptables/testing"
+	utilexec "k8s.io/utils/exec"
 )
 
 var hasRandomFully bool
@@ -692,4 +695,147 @@ func errorToString(err error) string {
 		return "nil error"
 	}
 	return fmt.Sprintf("error %q", err.Error())
+}
+
+// ---- IP rule (policy routing) tests ----
+
+// fakeExec is a minimal utilexec.Interface that records every command's argv
+// and scripts the output of "ip rule show prio <ipRulePriority>". It lets us
+// unit-test syncIPRules without shelling out to the ip tool.
+type fakeExec struct {
+	showOut []byte     // output returned for "ip rule show prio N"
+	calls   [][]string // recorded argv (including the command name) of every call
+}
+
+func (e *fakeExec) Command(cmd string, args ...string) utilexec.Cmd {
+	full := append([]string{cmd}, args...)
+	e.calls = append(e.calls, full)
+	return &fakeCmd{exec: e, full: full}
+}
+
+func (e *fakeExec) CommandContext(ctx context.Context, cmd string, args ...string) utilexec.Cmd {
+	return e.Command(cmd, args...)
+}
+
+func (e *fakeExec) LookPath(file string) (string, error) { return file, nil }
+
+type fakeCmd struct {
+	exec *fakeExec
+	full []string
+}
+
+func (c *fakeCmd) run() ([]byte, error) {
+	// "ip rule show prio N" returns the scripted snapshot of the node state.
+	if len(c.full) >= 3 && c.full[1] == "rule" && c.full[2] == "show" {
+		return c.exec.showOut, nil
+	}
+	// add/del are no-ops and always succeed.
+	return nil, nil
+}
+
+func (c *fakeCmd) Run() error                      { _, err := c.run(); return err }
+func (c *fakeCmd) CombinedOutput() ([]byte, error) { return c.run() }
+func (c *fakeCmd) Output() ([]byte, error)         { return c.run() }
+func (c *fakeCmd) SetDir(string)                   {}
+func (c *fakeCmd) SetStdin(io.Reader)              {}
+func (c *fakeCmd) SetStdout(io.Writer)             {}
+func (c *fakeCmd) SetStderr(io.Writer)             {}
+func (c *fakeCmd) SetEnv([]string)                 {}
+func (c *fakeCmd) StdoutPipe() (io.ReadCloser, error) { return nil, nil }
+func (c *fakeCmd) StderrPipe() (io.ReadCloser, error) { return nil, nil }
+func (c *fakeCmd) Start() error                    { return nil }
+func (c *fakeCmd) Wait() error                     { return nil }
+func (c *fakeCmd) Stop()                           {}
+
+// findCmd returns the first recorded call whose argv (after "rule") contains
+// the given subcommand ("add", "del", "show"), or nil.
+func (e *fakeExec) findCmd(sub string) []string {
+	for _, c := range e.calls {
+		if len(c) >= 2 && c[0] == "ip" && c[1] == "rule" && len(c) >= 3 && c[2] == sub {
+			return c
+		}
+	}
+	return nil
+}
+
+func TestGetIPRulesParsesCIDRs(t *testing.T) {
+	out := "20:\tnot from all to 10.30.0.0/16 lookup main\n" +
+		"20:\tnot from all to 10.40.0.0/16 lookup main\n"
+	m := NewFakeMasqDaemon()
+	m.execer = &fakeExec{showOut: []byte(out)}
+
+	got, err := m.getIPRules()
+	if err != nil {
+		t.Fatalf("getIPRules: %v", err)
+	}
+	want := map[string]bool{"10.30.0.0/16": true, "10.40.0.0/16": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("getIPRules = %v, want %v", got, want)
+	}
+}
+
+func TestSyncIPRulesNoChange(t *testing.T) {
+	ex := &fakeExec{showOut: []byte("20:\tnot from all to 10.30.0.0/16 lookup main\n")}
+	m := NewFakeMasqDaemon()
+	m.execer = ex
+	m.config.NonMasqueradeCIDRs = []string{"10.30.0.0/16"}
+
+	if err := m.syncIPRules(); err != nil {
+		t.Fatalf("syncIPRules: %v", err)
+	}
+	if ex.findCmd("add") != nil || ex.findCmd("del") != nil {
+		t.Fatalf("expected no add/del, recorded calls: %v", ex.calls)
+	}
+}
+
+// TestSyncIPRulesRemoveTokenization is a regression test for the bug observed
+// on a live NPN node: removeIPRule previously passed the whole rule as a single
+// argv element, causing "Error: argument ... is wrong: Failed to parse rule
+// type" on every reconciliation after a CIDR change, which in turn froze the
+// iptables masquerade sync. The fix passes properly tokenized argv plus prio.
+func TestSyncIPRulesRemoveTokenization(t *testing.T) {
+	ex := &fakeExec{showOut: []byte("20:\tnot from all to 10.30.0.0/16 lookup main\n")}
+	m := NewFakeMasqDaemon()
+	m.execer = ex
+	m.config.NonMasqueradeCIDRs = []string{"10.40.0.0/16"}
+
+	if err := m.syncIPRules(); err != nil {
+		t.Fatalf("syncIPRules: %v", err)
+	}
+
+	add := ex.findCmd("add")
+	if add == nil {
+		t.Fatalf("expected an 'ip rule add' call; got %v", ex.calls)
+	}
+	if want := []string{"ip", "rule", "add", "prio", "20", "not", "to", "10.40.0.0/16", "lookup", "main"}; !reflect.DeepEqual(add, want) {
+		t.Errorf("add argv = %v, want %v", add, want)
+	}
+
+	del := ex.findCmd("del")
+	if del == nil {
+		t.Fatalf("expected an 'ip rule del' call; got %v", ex.calls)
+	}
+	wantDel := []string{"ip", "rule", "del", "prio", "20", "not", "to", "10.30.0.0/16", "lookup", "main"}
+	if !reflect.DeepEqual(del, wantDel) {
+		t.Fatalf("del argv = %v, want %v (the original bug passed the rule as one string and was rejected by ip)", del, wantDel)
+	}
+}
+
+func TestSyncIPRulesIgnoresIPv6CIDRs(t *testing.T) {
+	ex := &fakeExec{showOut: nil}
+	m := NewFakeMasqDaemon()
+	m.execer = ex
+	m.config.NonMasqueradeCIDRs = []string{"10.30.0.0/16", "fc00::/7"}
+
+	if err := m.syncIPRules(); err != nil {
+		t.Fatalf("syncIPRules: %v", err)
+	}
+	// Only the IPv4 CIDR should produce an add rule.
+	for _, c := range ex.calls {
+		if len(c) >= 2 && c[1] == "add" {
+			if len(c) < 8 || c[7] != "10.30.0.0/16" {
+				t.Errorf("unexpected add argv %v", c)
+			}
+		}
+	}
 }

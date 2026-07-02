@@ -61,6 +61,91 @@ The agent accepts five flags, which may be specified in the yaml file.
 `to-ports`
 : MASQUERADE rules of iptables can select any port between 1024 and 65535 inclusively by default. This flag adds additional MASQUERADE rules for TCP, UDP and SCTP traffic to specify explicit source ports to be used (traffic in other protocols is unchanged). Ranges can be specified using `1024-29999` syntax, or multiple ranges with `1024-29999,32768-65535` where the traffic is balanced among all ports within the ranges.
 
+## Deploying on OKE with the Native Pod Network (NPN)
+
+This branch adds an enhancement for Oracle Kubernetes Engine (OKE) clusters that
+use the **Native Pod Network** (NPN, a.k.a. the VCN-native CNI). On NPN each pod
+gets a VCN IP and egress is routed by the CNI via per-pod policy routing rules
+(`ip rule`) rather than the host's `main` table. The stock `IP-MASQ-AGENT`
+iptables chain alone is therefore not sufficient to control which destinations
+get masqueraded on NPN nodes.
+
+In addition to the iptables rules, the agent maintains a **policy routing rule**
+per configured IPv4 `nonMasqueradeCIDR`:
+
+```
+20: not from all to <cidr> lookup main
+```
+
+A packet *not* destined for the configured CIDR is sent to the `main` routing
+table (where it is subject to the `IP-MASQ-AGENT` MASQUERADE rule), while a
+packet destined for the configured CIDR falls through to the NPN-managed rules
+and is delivered without masquerade. Priority `20` is intentionally lower than
+the NPN per-pod rules (which live at priority `512` and `1536`), so it is
+consulted first and never collides with the CNI.
+
+**Limitations of this mode:**
+- Only a **single** IPv4 CIDR is effective in `nonMasqueradeCIDRs`. This is
+  inherent to the `not to <cidr> lookup main` semantics (the complement match
+  covers "everything else"), so configure exactly one CIDR.
+- IPv6 CIDRs are skipped by the ip-rule path (IPv6 still uses the iptables
+  `IP-MASQ-AGENT` chain only).
+
+### Quick start on OKE NPN
+
+The `oke/` directory holds ready-to-apply manifests. The image is
+`docker.io/robocap/ip-masq-agent:v2` (an Alpine-based image that bundles
+`iproute2` and `iptables`, required because `ip rule` is used in addition to
+iptables). The DaemonSet runs with `hostNetwork: true` and `NET_ADMIN`/`NET_RAW`
+capabilities, and tolerates all taints so it lands on every node.
+
+1. Create the ConfigMap. Set `nonMasqueradeCIDRs` to the **single** CIDR you do
+   not want masqueraded (typically your in-cluster pod/service range):
+
+   ```yaml
+   # oke/config.yaml
+   apiVersion: v1
+   kind: ConfigMap
+   metadata:
+     name: ip-masq-agent
+     namespace: kube-system
+   data:
+     config: |
+       nonMasqueradeCIDRs:
+         - 10.30.0.0/16
+       resyncInterval: 10s
+       masqLinkLocal: false
+   ```
+
+   ```
+   kubectl apply -f oke/config.yaml
+   ```
+
+2. Deploy the DaemonSet:
+
+   ```
+   kubectl apply -f oke/ip-masq-agent.yaml
+   ```
+
+3. Verify the policy rule and the iptables chain are present on a node:
+
+   ```
+   $ kubectl exec -n kube-system ds/ip-masq-agent -- ip rule show prio 20
+   20:     not from all to 10.30.0.0/16 lookup main
+
+   $ kubectl exec -n kube-system ds/ip-masq-agent -- iptables -t nat -S IP-MASQ-AGENT
+   -N IP-MASQ-AGENT
+   -A IP-MASQ-AGENT -d 169.254.0.0/16 ... -j RETURN
+   -A IP-MASQ-AGENT -d 10.30.0.0/16 ... -j RETURN
+   -A IP-MASQ-AGENT ... -j MASQUERADE --random-fully
+   ```
+
+The agent reconciles both the policy rules and the iptables chain every
+`resyncInterval`. If you edit the ConfigMap and change the CIDR, the previous
+`ip rule` is removed and the new one is added on the next sync; the stale rule
+is deleted with properly tokenized argv (`ip rule del prio 20 not to <cidr>
+lookup main`).
+
 ## Rationale
 (from the [incubator proposal](https://gist.github.com/mtaufen/253309166e7d5aa9e9b560600a438447))
 
